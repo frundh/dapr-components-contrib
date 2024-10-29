@@ -15,10 +15,12 @@ package cosmosdb
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"reflect"
 	"strings"
@@ -29,6 +31,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
 	"github.com/google/uuid"
 	jsoniter "github.com/json-iterator/go"
+	"golang.org/x/net/http2"
 
 	"github.com/dapr/components-contrib/common/authentication/azure"
 	"github.com/dapr/components-contrib/contenttype"
@@ -52,11 +55,12 @@ type StateStore struct {
 }
 
 type metadata struct {
-	URL         string `json:"url"`
-	MasterKey   string `json:"masterKey"`
-	Database    string `json:"database"`
-	Collection  string `json:"collection"`
-	ContentType string `json:"contentType"`
+	URL                   string `json:"url"`
+	MasterKey             string `json:"masterKey"`
+	Database              string `json:"database"`
+	Collection            string `json:"collection"`
+	ContentType           string `json:"contentType"`
+	InsecureSkipTlsVerify bool   `json:"insecureSkipTlsVerify"`
 }
 
 type cosmosOperationType string
@@ -140,6 +144,18 @@ func (c *StateStore) Init(ctx context.Context, meta state.Metadata) error {
 		return errors.New("contentType is required")
 	}
 
+	// Check if TLS verification should be skipped.
+	// This is useful for development, e.g. when using the CosmosDB emulator, but should not be used in production.
+	// https://learn.microsoft.com/en-us/azure/cosmos-db/how-to-develop-emulator
+	var transport *http.Client
+	if m.InsecureSkipTlsVerify {
+		// Create a new HTTP client that skips TLS verification
+		transport = newInsecureHTTPClient()
+	} else {
+		// Use the default client from the Azure SDK
+		transport = nil
+	}
+
 	// Internal query policy was created due to lack of cross partition query capability in the current Go sdk
 	opts := azcosmos.ClientOptions{
 		ClientOptions: policy.ClientOptions{
@@ -149,6 +165,7 @@ func (c *StateStore) Init(ctx context.Context, meta state.Metadata) error {
 			Telemetry: policy.TelemetryOptions{
 				ApplicationID: "dapr-" + logger.DaprVersion,
 			},
+			Transport: transport,
 		},
 	}
 
@@ -732,4 +749,45 @@ func NewCosmosItemFromResponse(value []byte, logger logger.Logger) (item CosmosI
 	}
 
 	return item, nil
+}
+
+// Create a new HTTP client that skips TLS verification.
+// Should only be used for development.
+func newInsecureHTTPClient() *http.Client {
+	transport := defaultHTTPTransport()
+	transport.TLSClientConfig.InsecureSkipVerify = true
+	client := &http.Client{
+		Transport: transport,
+	}
+	return client
+}
+
+// Copy of the default HTTP transport from the Azure SDK. Not exported, so we have to copy it here.
+// https://github.com/Azure/azure-sdk-for-go/blob/main/sdk/azcore/runtime/transport_default_http_client.go
+func defaultHTTPTransport() *http.Transport {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			MinVersion:    tls.VersionTLS12,
+			Renegotiation: tls.RenegotiateFreelyAsClient,
+		},
+	}
+	// TODO: evaluate removing this once https://github.com/golang/go/issues/59690 has been fixed
+	if http2Transport, err := http2.ConfigureTransports(transport); err == nil {
+		// if the connection has been idle for 10 seconds, send a ping frame for a health check
+		http2Transport.ReadIdleTimeout = 10 * time.Second
+		// if there's no response to the ping within the timeout, the connection will be closed
+		http2Transport.PingTimeout = 5 * time.Second
+	}
+	return transport
 }
